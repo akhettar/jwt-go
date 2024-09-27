@@ -67,17 +67,15 @@ type AuthMiddleware struct {
 	// to verify issuer
 	VerifyIssuer bool
 
-	// Region aws region
-	Region string
-
-	// UserPoolID the cognito user pool id
-	UserPoolID string
-
 	// The issuer
 	Iss string
 
 	// JWK public JSON Web Key (JWK) for your user pool
 	JWK map[string]JWKKey
+
+	// skipTokenUseValidation is a flag that determines whether the "token_use" claim validation should be skipped.
+	// If set to true, the "token_use" claim will not be checked during the JWT claims validation process.
+	skipTokenUseValidation bool
 }
 
 // JWK is json data struct for JSON Web Key
@@ -200,7 +198,7 @@ func (mw *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 }
 
 // AuthJWTMiddleware create an instance of the middle ware function
-func AuthJWTMiddleware(iss, userPoolID, region string, jwk map[string]JWKKey) (*AuthMiddleware, error) {
+func AuthJWTMiddleware(iss string, jwk map[string]JWKKey, opts ...Option) (*AuthMiddleware, error) {
 	authMiddleware := &AuthMiddleware{
 		Timeout: time.Hour,
 
@@ -213,10 +211,24 @@ func AuthJWTMiddleware(iss, userPoolID, region string, jwk map[string]JWKKey) (*
 		TimeFunc:    time.Now,
 		JWK:         jwk,
 		Iss:         iss,
-		Region:      region,
-		UserPoolID:  userPoolID,
 	}
+
+	for _, opt := range opts {
+		opt(authMiddleware)
+	}
+
 	return authMiddleware, nil
+}
+
+// Option defines a function type that modifies the AuthMiddleware.
+type Option func(query *AuthMiddleware)
+
+// WithSkipTokenUseValidation returns an Option that sets the skipTokenUseValidation field in AuthMiddleware.
+// This option allows skipping the validation of the token_use claim in JWT tokens.
+func WithSkipTokenUseValidation(skipTokenUseValidation bool) Option {
+	return func(query *AuthMiddleware) {
+		query.skipTokenUseValidation = skipTokenUseValidation
+	}
 }
 
 func (mw *AuthMiddleware) parse(tokenStr string) (*jwtgo.Token, error) {
@@ -249,16 +261,13 @@ func (mw *AuthMiddleware) parse(tokenStr string) (*jwtgo.Token, error) {
 
 	claims := token.Claims.(jwtgo.MapClaims)
 
-	iss, ok := claims["iss"]
+	_, ok := claims["iss"]
 	if !ok {
 		return token, fmt.Errorf("token does not contain issuer")
 	}
-	issStr := iss.(string)
-	if strings.Contains(issStr, "cognito-idp") {
-		err = validateAWSJwtClaims(claims, mw.Region, mw.UserPoolID, mw.DebugLog)
-		if err != nil {
-			return token, err
-		}
+	err = mw.validateJwtClaims(claims)
+	if err != nil {
+		return token, err
 	}
 
 	if token.Valid {
@@ -267,36 +276,31 @@ func (mw *AuthMiddleware) parse(tokenStr string) (*jwtgo.Token, error) {
 	return token, err
 }
 
-// validateAWSJwtClaims validates AWS Cognito User Pool JWT
-func validateAWSJwtClaims(claims jwtgo.MapClaims, region, userPoolID string, debugLog bool) error {
+// validateJwtClaims validates the JWT claims provided in the token.
+// It performs the following checks:
+// 1. Validates the "iss" claim to ensure it matches the expected issuer.
+// 2. Optionally validates the "token_use" claim if skipTokenUseValidation is false.
+// 3. Validates the "exp" claim to ensure the token is not expired.
+// If any of these validations fail, an error is returned.
+func (mw *AuthMiddleware) validateJwtClaims(claims jwtgo.MapClaims) error {
 	var err error
 	// 3. Check the iss claim. It should match your user pool.
-	issShoudBe := fmt.Sprintf("https://cognito-idp.%v.amazonaws.com/%v", region, userPoolID)
-	err = validateClaimItem("iss", []string{issShoudBe}, claims)
+	err = validateClaimItem("iss", []string{mw.Iss}, claims)
 	if err != nil {
 		Error.Printf("Failed to validate the jwt token claims %v", err)
 		return err
 	}
 
 	// 4. Check the token_use claim.
-	validateTokenUse := func() error {
-		if tokenUse, ok := claims["token_use"]; ok {
-			if tokenUseStr, ok := tokenUse.(string); ok {
-				if tokenUseStr == "id" || tokenUseStr == "access" {
-					return nil
-				}
-			}
+	if !mw.skipTokenUseValidation {
+		err = validateTokenUse(claims)
+		if err != nil {
+			return err
 		}
-		return errors.New("token_use should be id or access")
-	}
-
-	err = validateTokenUse()
-	if err != nil {
-		return err
 	}
 
 	// 7. Check the exp claim and make sure the token is not expired.
-	err = validateExpired(claims, debugLog)
+	err = validateExpired(claims, mw.DebugLog)
 	if err != nil {
 		return err
 	}
@@ -333,6 +337,20 @@ func validateExpired(claims jwtgo.MapClaims, debugLog bool) error {
 		return errors.New("cannot parse token exp")
 	}
 	return errors.New("token is expired")
+}
+
+// validateTokenUse checks the "token_use" claim in the JWT claims.
+// It ensures that the "token_use" claim is either "id" or "access".
+// If the claim is not present or does not match the expected values, an error is returned.
+func validateTokenUse(claims jwtgo.MapClaims) error {
+	if tokenUse, ok := claims["token_use"]; ok {
+		if tokenUseStr, ok := tokenUse.(string); ok {
+			if tokenUseStr == "id" || tokenUseStr == "access" {
+				return nil
+			}
+		}
+	}
+	return errors.New("token_use should be id or access")
 }
 
 func convertKey(rawE, rawN string) *rsa.PublicKey {
